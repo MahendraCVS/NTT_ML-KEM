@@ -1,0 +1,10 @@
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache/
+ntt_dag.png
+ntt_twiddle_trace.csv
+.venv/
+venv/
+env/
