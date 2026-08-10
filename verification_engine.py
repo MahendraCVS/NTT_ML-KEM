@@ -118,9 +118,10 @@ class BankConflict:
     port_capacity: int
     addresses: List[int] = field(default_factory=list)          # the specific addresses contending for this bank
     conflicting_node_ids: List[str] = field(default_factory=list)
+    cycle_in_stage: int = 0
 
     def __str__(self) -> str:
-        return (f"Stage {self.stage_number}, Bank {self.bank_id} [{self.access_type}]: "
+        return (f"Stage {self.stage_number} Cycle {self.cycle_in_stage}, Bank {self.bank_id} [{self.access_type}]: "
                 f"{self.requested_accesses} requested vs {self.port_capacity} port(s) available "
                 f"-- addresses {self.addresses}")
 
@@ -140,6 +141,7 @@ class CycleAccessReport:
     requested: int                             # max simultaneous accesses to any single bank this cycle
     capacity: int
     passed: bool                               # True iff requested <= capacity for every bank
+    cycle_in_stage: int = 0
 
 
 @dataclass
@@ -362,12 +364,13 @@ class ScheduleVerifier:
     def _simulate_bank_cycles(
         self,
         num_banks: int,
-        max_reads_per_bank: int,
-        max_writes_per_bank: int,
+        max_reads_per_bank: int = 2,
+        max_writes_per_bank: int = 2,
         banking_mode: str = "modulo",
+        parallel_units: int = 4,
     ) -> List[CycleAccessReport]:
         """Single source of truth for the bank simulation: one
-        `CycleAccessReport` per (stage, access_type) present in
+        `CycleAccessReport` per (stage, cycle, access_type) present in
         execution_log, covering EVERY bank touched that cycle -- not just
         the ones that end up conflicting. `verify_memory_banks()` and the
         text report are both built from this.
@@ -377,12 +380,9 @@ class ScheduleVerifier:
         - Memory addresses are interleaved across `num_banks` banks via
           `bank_id = address % num_banks` (standard low-order interleaving,
           as used in real NTT/FFT accelerators).
-        - Every operation belonging to the same `stage_number` is assumed
-          to execute CONCURRENTLY, in the same hardware cycle -- the
-          standard parallel-butterfly-array model for NTT hardware.
-        - Each bank is a dual-port (by default) RAM: it can service at most
-          `max_reads_per_bank` reads AND `max_writes_per_bank` writes per
-          cycle, independently of each other.
+        - Butterfly operations in a stage are chunked into size `parallel_units`,
+          representing the operations processed in one hardware cycle.
+        - Under per-cycle simulation, a bank can service at most 1 access per cycle.
         """
         steps_by_stage: Dict[int, List[ButterflyStep]] = defaultdict(list)
         for step in self.execution_log:
@@ -393,44 +393,53 @@ class ScheduleVerifier:
         for stage_number in sorted(steps_by_stage):
             stage_steps = steps_by_stage[stage_number]
 
-            for access_type, capacity, field_getter in (
-                ("Reads", max_reads_per_bank, lambda s: s.inputs),
-                ("Writes", max_writes_per_bank, lambda s: s.outputs),
-            ):
-                bank_addresses: Dict[int, List[int]] = defaultdict(list)
-                bank_node_ids: Dict[int, List[str]] = defaultdict(list)
+            # Chunk stage_steps into groups of parallel_units
+            num_steps = len(stage_steps)
+            chunks = [stage_steps[i:i + parallel_units] for i in range(0, num_steps, parallel_units)]
 
-                N = self.n if getattr(self, "n", None) is not None else 256
-                chunk_size = max(1, N // num_banks)
-                shift = int(math.log2(num_banks)) if num_banks > 1 else 0
+            for cycle_in_stage, chunk in enumerate(chunks):
+                for access_type, field_getter in (
+                    ("Reads", lambda s: s.inputs),
+                    ("Writes", lambda s: s.outputs),
+                ):
+                    bank_addresses: Dict[int, List[int]] = defaultdict(list)
+                    bank_node_ids: Dict[int, List[str]] = defaultdict(list)
 
-                for step in stage_steps:
-                    for addr in field_getter(step):
-                        if banking_mode == "block":
-                            bank = min(num_banks - 1, (addr % N) // chunk_size)
-                        elif banking_mode == "xor":
-                            bank = (addr ^ (addr >> shift)) % num_banks
-                        else: # "modulo"
-                            bank = addr % num_banks
+                    N = self.n if getattr(self, "n", None) is not None else 256
+                    chunk_size = max(1, N // num_banks)
+                    shift = int(math.log2(num_banks)) if num_banks > 1 else 0
 
-                        bank_addresses[bank].append(addr)
-                        bank_node_ids[bank].append(step.node_id)
+                    for step in chunk:
+                        for addr in field_getter(step):
+                            if banking_mode == "block":
+                                bank = min(num_banks - 1, (addr % N) // chunk_size)
+                            elif banking_mode == "xor":
+                                bank = (addr ^ (addr >> shift)) % num_banks
+                            else: # "modulo"
+                                bank = addr % num_banks
 
-                for bank in bank_addresses:
-                    bank_addresses[bank].sort()
+                            bank_addresses[bank].append(addr)
+                            bank_node_ids[bank].append(step.node_id)
 
-                requested = max((len(v) for v in bank_addresses.values()), default=0)
-                passed = requested <= capacity
+                    for bank in bank_addresses:
+                        bank_addresses[bank].sort()
 
-                reports.append(CycleAccessReport(
-                    stage_number=stage_number,
-                    access_type=access_type,
-                    bank_addresses=dict(bank_addresses),
-                    bank_node_ids=dict(bank_node_ids),
-                    requested=requested,
-                    capacity=capacity,
-                    passed=passed,
-                ))
+                    requested = max((len(v) for v in bank_addresses.values()), default=0)
+                    
+                    # Under the per-cycle simulation, a bank can service up to the designated capacity per cycle.
+                    capacity = max_reads_per_bank if access_type == "Reads" else max_writes_per_bank
+                    passed = requested <= capacity
+
+                    reports.append(CycleAccessReport(
+                        stage_number=stage_number,
+                        access_type=access_type,
+                        bank_addresses=dict(bank_addresses),
+                        bank_node_ids=dict(bank_node_ids),
+                        requested=requested,
+                        capacity=capacity,
+                        passed=passed,
+                        cycle_in_stage=cycle_in_stage,
+                    ))
 
         return reports
 
@@ -440,6 +449,7 @@ class ScheduleVerifier:
         max_reads_per_bank: int = 2,
         max_writes_per_bank: int = 2,
         banking_mode: str = "modulo",
+        parallel_units: int = 4,
     ) -> Tuple[bool, List[BankConflict]]:
         """Run the bank simulation and flag every bank that's asked for
         more simultaneous accesses than it has ports for.
@@ -452,23 +462,29 @@ class ScheduleVerifier:
             exceeds capacity.
         """
         reports = self._simulate_bank_cycles(
-            num_banks, max_reads_per_bank, max_writes_per_bank, banking_mode=banking_mode
+            num_banks=num_banks,
+            max_reads_per_bank=max_reads_per_bank,
+            max_writes_per_bank=max_writes_per_bank,
+            banking_mode=banking_mode,
+            parallel_units=parallel_units
         )
 
         conflicts: List[BankConflict] = []
         for report in reports:
             if report.passed:
                 continue
+            capacity = max_reads_per_bank if report.access_type == "Reads" else max_writes_per_bank
             for bank_id, addresses in report.bank_addresses.items():
-                if len(addresses) > report.capacity:
+                if len(addresses) > capacity:
                     conflicts.append(BankConflict(
                         stage_number=report.stage_number,
                         bank_id=bank_id,
                         access_type=report.access_type.rstrip("s").lower(),  # "Reads" -> "read"
                         requested_accesses=len(addresses),
-                        port_capacity=report.capacity,
+                        port_capacity=capacity,
                         addresses=addresses,
                         conflicting_node_ids=report.bank_node_ids[bank_id],
+                        cycle_in_stage=report.cycle_in_stage,
                     ))
 
         return (len(conflicts) == 0), conflicts
@@ -573,14 +589,28 @@ class ScheduleVerifier:
 
     # -- Combined report -----------------------------------------------------
 
-    def verify_all(self, num_banks: int = 2, banking_mode: str = "modulo") -> dict:
+    def verify_all(
+        self,
+        num_banks: int = 2,
+        max_reads_per_bank: int = 2,
+        max_writes_per_bank: int = 2,
+        banking_mode: str = "modulo",
+        parallel_units: int = 4,
+    ) -> dict:
         """Run every check and return everything as one structured dict --
         the shape a Streamlit panel would want to consume directly (no
         string re-parsing needed) while still being handy for `__main__`.
         """
         dep_result = self.verify_dependencies()
-        bank_passed, bank_conflicts = self.verify_memory_banks(num_banks=num_banks, banking_mode=banking_mode)
+        bank_passed, bank_conflicts = self.verify_memory_banks(
+            num_banks=num_banks,
+            max_reads_per_bank=max_reads_per_bank,
+            max_writes_per_bank=max_writes_per_bank,
+            banking_mode=banking_mode,
+            parallel_units=parallel_units,
+        )
         dag_stats = self.compute_dag_statistics()
+        total_bottlenecks = sum(max(0, c.requested_accesses - c.port_capacity) for c in bank_conflicts)
         return {
             "dependency_check": {
                 "passed": dep_result.passed,
@@ -591,12 +621,13 @@ class ScheduleVerifier:
                 "passed": bank_passed,
                 "num_banks": num_banks,
                 "conflicts": bank_conflicts,
+                "total_architectural_bottlenecks": total_bottlenecks,
             },
             "dag_statistics": dag_stats,
         }
 
     def generate_report(self, num_banks: int = 2, max_reads_per_bank: int = 2,
-                         max_writes_per_bank: int = 2) -> str:
+                         max_writes_per_bank: int = 2, parallel_units: int = 4) -> str:
         """Render a clean, human-readable text report combining DAG
         statistics, the Dependency Verification Engine checklist, and the
         Memory Bank Simulation. Kept separate from `verify_all()` so the
@@ -647,15 +678,21 @@ class ScheduleVerifier:
             num_banks=num_banks,
             max_reads_per_bank=max_reads_per_bank,
             max_writes_per_bank=max_writes_per_bank,
+            parallel_units=parallel_units,
         )
-        lines.append(f"\nMemory Bank Simulation (num_banks={num_banks})")
+        lines.append(f"\nMemory Bank Simulation (num_banks={num_banks}, parallel_units={parallel_units})")
         if bank_passed:
             lines.append("✓ No bank conflicts detected in any cycle.")
         else:
             # Re-run the full simulation (not just the conflict list) so we
             # can print EVERY bank touched in a failing cycle for context,
             # matching the requested granular format exactly.
-            reports = self._simulate_bank_cycles(num_banks, max_reads_per_bank, max_writes_per_bank)
+            reports = self._simulate_bank_cycles(
+                num_banks=num_banks,
+                max_reads_per_bank=max_reads_per_bank,
+                max_writes_per_bank=max_writes_per_bank,
+                parallel_units=parallel_units
+            )
             reports_by_stage: Dict[int, List[CycleAccessReport]] = defaultdict(list)
             for r in reports:
                 reports_by_stage[r.stage_number].append(r)
@@ -664,12 +701,12 @@ class ScheduleVerifier:
                 stage_reports = [r for r in reports_by_stage[stage_number] if not r.passed]
                 if not stage_reports:
                     continue
-                lines.append(f"\nCycle {stage_number}")
+                lines.append(f"\nStage {stage_number}")
                 for r in stage_reports:
-                    lines.append(r.access_type)
+                    lines.append(f"  Cycle {getattr(r, 'cycle_in_stage', 0)} ({r.access_type})")
                     for bank_id in sorted(r.bank_addresses):
-                        lines.append(f"Bank {bank_id}: Addr {r.bank_addresses[bank_id]}")
-                    lines.append(f"Result: FAIL (Requested {r.requested}, Port Capacity {r.capacity})")
+                        lines.append(f"    Bank {bank_id}: Addr {r.bank_addresses[bank_id]}")
+                    lines.append(f"    Result: FAIL (Requested {r.requested}, Port Capacity {r.capacity})")
 
         lines.append("\n" + "=" * 72)
         overall = "✅ ALL CHECKS PASSED" if dep_result.passed and bank_passed else "❌ ISSUES DETECTED"

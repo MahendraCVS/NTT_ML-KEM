@@ -912,6 +912,40 @@ def naive_ntt(input_poly: List[int], n: int, q: int, root: int) -> List[int]:
 
 
 # ---------------------------------------------------------------------------
+# Memory Conflict / Collision calculation helper (used by verifiers / UI)
+# ---------------------------------------------------------------------------
+
+def calculate_memory_bank_collisions(
+    execution_log: List[Any],
+    num_banks: int,
+    banking_mode: str,
+    parallel_units: int,
+    n: int = 256
+) -> Tuple[bool, List[Any], int, List[Any]]:
+    """Exposes memory bank collision logic from the verifier.
+    Returns (passed, conflicts, total_architectural_bottlenecks, reports).
+    """
+    from verification_engine import ScheduleVerifier
+    verifier = ScheduleVerifier(None, execution_log, n=n)
+    reports = verifier._simulate_bank_cycles(
+        num_banks=num_banks,
+        max_reads_per_bank=2,
+        max_writes_per_bank=2,
+        banking_mode=banking_mode,
+        parallel_units=parallel_units
+    )
+    passed, conflicts = verifier.verify_memory_banks(
+        num_banks=num_banks,
+        max_reads_per_bank=2,
+        max_writes_per_bank=2,
+        banking_mode=banking_mode,
+        parallel_units=parallel_units
+    )
+    total_bottlenecks = sum(max(0, c.requested_accesses - c.port_capacity) for c in conflicts)
+    return passed, conflicts, total_bottlenecks, reports
+
+
+# ---------------------------------------------------------------------------
 # Demo / self-test
 # ---------------------------------------------------------------------------
 

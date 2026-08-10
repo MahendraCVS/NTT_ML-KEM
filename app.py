@@ -120,10 +120,14 @@ def compute_naive_poly_mul_cached(poly_a: tuple[int, ...], poly_b: tuple[int, ..
 
 def draw_bank_heatmap(reports: list[CycleAccessReport], num_banks: int, capacity: int = 2) -> plt.Figure:
     """Generate a Matplotlib heatmap showing memory bank accesses and conflicts per cycle/stage."""
-    # Sort reports: stage first, then Reads, then Writes
-    sorted_reports = sorted(reports, key=lambda r: (r.stage_number, 0 if r.access_type == "Reads" else 1))
+    # Sort reports: stage first, then cycle, then Reads, then Writes
+    sorted_reports = sorted(reports, key=lambda r: (
+        r.stage_number,
+        getattr(r, 'cycle_in_stage', 0),
+        0 if r.access_type == "Reads" else 1
+    ))
     
-    y_labels = [f"Stage {r.stage_number} ({r.access_type})" for r in sorted_reports]
+    y_labels = [f"St{r.stage_number} Cy{getattr(r, 'cycle_in_stage', 0)} ({r.access_type})" for r in sorted_reports]
     
     data_grid = []
     for r in sorted_reports:
@@ -132,8 +136,9 @@ def draw_bank_heatmap(reports: list[CycleAccessReport], num_banks: int, capacity
         
     data = np.array(data_grid)
     
-    # Figure sizing based on bank count and stages count
-    fig, ax = plt.subplots(figsize=(max(5, num_banks * 0.9), max(3, len(y_labels) * 0.35)))
+    # Figure sizing based on bank count and stages count, capping height to prevent Matplotlib rendering crashes
+    height = max(3.0, min(100.0, len(y_labels) * 0.35))
+    fig, ax = plt.subplots(figsize=(max(5.0, num_banks * 0.9), height))
     
     if data.size > 0:
         vmax = max(4, np.max(data))
@@ -151,10 +156,11 @@ def draw_bank_heatmap(reports: list[CycleAccessReport], num_banks: int, capacity
     
     # Render value count inside each cell
     for i in range(len(y_labels)):
+        cap = getattr(sorted_reports[i], 'capacity', capacity)
         for j in range(num_banks):
             val = data[i, j]
             # White text for high access counts (darker red background) for visibility
-            text_color = "white" if val > capacity else "black"
+            text_color = "white" if val > cap else "black"
             ax.text(j, i, str(val), ha="center", va="center", color=text_color, fontsize=9.5, fontweight="bold")
             
     ax.set_title("Memory Access Heat Map", fontsize=11, fontweight="bold", pad=10)
@@ -497,7 +503,7 @@ num_banks = st.sidebar.slider(
     max_value=8,
     value=2,
     help=(
-        "Simulated dual-port RAM banks. Drive this up "
+        "Simulated RAM banks. Drive this up "
         "to see how many banks are actually needed for a conflict-free "
         "schedule at the current N."
     ),
@@ -508,6 +514,14 @@ banking_strategy = st.sidebar.selectbox(
     help="Select the address mapping function used to partition memory into banks."
 )
 banking_mode = banking_strategy.lower()
+parallel_units = st.sidebar.slider(
+    "Parallel Hardware Units",
+    min_value=1,
+    max_value=16,
+    value=4,
+    step=1,
+    help="Number of butterfly operations the hardware can process per clock cycle."
+)
 
 st.sidebar.markdown("---")
 st.sidebar.subheader("🛡️ Verification Settings")
@@ -676,7 +690,7 @@ max_step = len(execution_log) - 1
 
 # Run the verifier ONCE per rerun using the possibly mutated copies
 verifier = ScheduleVerifier(mutated_graph, execution_log, n=n)
-verification = verifier.verify_all(num_banks=num_banks, banking_mode=banking_mode)
+verification = verifier.verify_all(num_banks=num_banks, banking_mode=banking_mode, parallel_units=parallel_units)
 dag_statistics = verification["dag_statistics"]
 
 # ---------------------------------------------------------------------------
@@ -959,7 +973,8 @@ else:
 # 6. Memory Verification
 bank_check = verification["memory_bank_check"]
 memory_passed = bank_check["passed"]
-memory_msg = "Memory bank access conflict-free." if memory_passed else f"{len(bank_check['conflicts'])} port conflict(s) detected."
+total_bottlenecks = bank_check.get("total_architectural_bottlenecks", len(bank_check['conflicts']))
+memory_msg = "Memory bank access conflict-free." if memory_passed else f"{total_bottlenecks} architectural bottleneck(s) detected."
 
 # 7. Output Entropy Verification
 entropy_res = verifier.verify_output_entropy(active_result, threshold=0.9)
@@ -1026,13 +1041,14 @@ with st.expander("🔬 View Detailed Dependency & Sequence Verification Log", ex
 # --- 2. Memory Bank Simulation Details ---
 st.markdown(f"### 🗄️ Memory Bank Simulation (banks = {bank_check['num_banks']}, strategy = {banking_strategy})")
 st.caption(
-    f"This simulation checks for port resource bottlenecks based on the selected "
+    f"This simulation checks for architectural bottleneck(s) based on the selected "
     f"**{banking_strategy}** banking model. Results and conflicts are specific to this mapping."
 )
 if not bank_check["passed"]:
     conflicts = bank_check["conflicts"]
+    total_bottlenecks = bank_check.get("total_architectural_bottlenecks", len(conflicts))
     st.error(
-        f"{len(conflicts)} architectural bottleneck(s) detected across "
+        f"{total_bottlenecks} architectural bottleneck(s) detected across "
         f"{bank_check['num_banks']} bank(s) using the {banking_strategy} strategy. "
         f"Try raising 'Number of Memory Banks' or switching the 'Memory Banking Strategy' in the sidebar."
     )
@@ -1041,10 +1057,11 @@ if not bank_check["passed"]:
             [
                 {
                     "Stage": c.stage_number,
+                    "Cycle": getattr(c, "cycle_in_stage", 0),
                     "Bank": c.bank_id,
                     "Access Type": c.access_type,
                     "Requested": c.requested_accesses,
-                    "Available Ports": c.port_capacity,
+                    "Capacity Limit": c.port_capacity,
                     "Node IDs": ", ".join(c.conflicting_node_ids),
                 }
                 for c in conflicts
@@ -1056,18 +1073,56 @@ if not bank_check["passed"]:
 st.markdown(f"**Memory Access Heat Map**")
 st.caption(
     f"The heatmap below visualizes the total memory read/write requests mapped to each "
-    f"physical bank per execution stage under the **{banking_strategy}** model. "
-    f"Any bank cell with value > 2 (capacity limit) is an architectural access conflict."
+    f"bank per clock cycle under the **{banking_strategy}** banking model. "
+    f"Any bank cell with value > 2 is an architectural access conflict."
 )
 reports = verifier._simulate_bank_cycles(
     num_banks=num_banks,
     max_reads_per_bank=2,
     max_writes_per_bank=2,
-    banking_mode=banking_mode
+    banking_mode=banking_mode,
+    parallel_units=parallel_units
 )
-fig_heatmap = draw_bank_heatmap(reports, num_banks, capacity=2)
-st.pyplot(fig_heatmap)
-plt.close(fig_heatmap)
+if reports:
+    sorted_reports = sorted(reports, key=lambda r: (
+        r.stage_number,
+        getattr(r, 'cycle_in_stage', 0),
+        0 if r.access_type == "Reads" else 1
+    ))
+    
+    total_cycles = len(sorted_reports)
+    if total_cycles > 100:
+        st.warning(
+            f"The simulation trace contains {total_cycles} cycle operations. Visualizing all cycles at once "
+            "makes the heatmap extremely long, unreadable, and could exceed image size limits. "
+            "Please select a subset of cycles (max 100 cycles) to visualize below."
+        )
+        
+        start_idx, end_idx = st.slider(
+            "Select Range of Cycle Operations to Display",
+            min_value=0,
+            max_value=total_cycles,
+            value=(0, min(total_cycles, 50)),
+            step=1,
+            help="Select the start and end indices of the cycles to view in the heatmap."
+        )
+        
+        range_size = end_idx - start_idx
+        if range_size <= 0:
+            st.error("Please select a range containing at least 1 cycle.")
+        elif range_size > 100:
+            st.error(f"Selected range is too large ({range_size} cycles). Please limit your selection to at most 100 cycles to render the heatmap.")
+        else:
+            visible_reports = sorted_reports[start_idx:end_idx]
+            fig_heatmap = draw_bank_heatmap(visible_reports, num_banks, capacity=2)
+            st.pyplot(fig_heatmap)
+            plt.close(fig_heatmap)
+    else:
+        fig_heatmap = draw_bank_heatmap(sorted_reports, num_banks, capacity=2)
+        st.pyplot(fig_heatmap)
+        plt.close(fig_heatmap)
+else:
+    st.info("No memory access reports available to generate the heatmap.")
 
 # --- 3. Reference Verification Details ---
 st.markdown("### 🥇 Functional Reference Verification Details")
