@@ -32,7 +32,6 @@ import numpy as np
 
 from ntt_engine import NTTEngine, NTTResult, ButterflyStep, naive_ntt
 from verification_engine import ScheduleVerifier, CycleAccessReport
-from reference_validator import ReferenceValidator
 
 # ---------------------------------------------------------------------------
 # Fixed constants
@@ -52,11 +51,7 @@ ALGO_INCOMPLETE = "Kyber Incomplete NTT (7-Stage)"
 # of overlapping text -- this mainly bites at N=256.
 LABEL_NODE_THRESHOLD = 150
 
-# Hardcoded NIST / Reference test vector (dummy data structured for easy hex swap later)
-NIST_VECTOR_N = 256
-NIST_VECTOR_A = list(range(256))
-NIST_VECTOR_B = [i * 2 for i in range(256)]
-NIST_VECTOR_EXPECTED = [400, 2212, 1211, 730, 773, 1344, 2447, 757, 2936, 2330, 2272, 2766, 487, 2097, 942, 355, 340, 901, 2042, 438, 2751, 2327, 2499, 3271, 1318, 3302, 2569, 2452, 2955, 753, 2508, 1566, 1260, 1594, 2572, 869, 3147, 2752, 3017, 617, 2214, 1154, 770, 1066, 2046, 385, 2745, 2472, 2899, 701, 2540, 1762, 1700, 2358, 411, 2521, 2034, 2283, 3272, 1676, 828, 732, 1392, 2812, 1667, 1290, 1685, 2856, 1478, 884, 1078, 2064, 517, 3099, 3156, 692, 2369, 1533, 1517, 2325, 632, 3100, 3075, 561, 2220, 1398, 1428, 2314, 731, 12, 161, 1182, 3079, 2527, 2859, 750, 2862, 2541, 3120, 1274, 336, 310, 1200, 3010, 2415, 2748, 684, 2885, 2697, 124, 1828, 1155, 1438, 2681, 1559, 1405, 2223, 688, 133, 562, 1979, 1059, 1135, 2211, 962, 721, 1492, 3279, 2757, 3259, 1460, 693, 962, 2271, 1295, 1367, 2491, 1342, 1253, 2228, 942, 728, 1590, 203, 3229, 685, 2562, 2206, 2950, 1469, 1096, 1835, 361, 7, 777, 2675, 2376, 3213, 1861, 1653, 2593, 1356, 1275, 2354, 1268, 1350, 2604, 1705, 1986, 122, 2775, 3291, 1674, 1257, 2044, 710, 588, 1682, 667, 876, 2313, 1653, 2229, 716, 447, 1426, 328, 486, 1904, 1257, 1878, 442, 282, 1402, 477, 840, 2495, 2117, 3039, 1936, 2141, 329, 3162, 657, 2805, 2952, 1102, 588, 1414, 255, 444, 1985, 1553, 2481, 1444, 1775, 149, 3228, 1029, 214, 787, 2752, 2784, 887, 394, 1309, 307, 721, 2555, 2484, 512, 3301, 868, 3204, 326, 2225, 2247, 396, 5, 1078, 290, 974, 3134, 116, 1911, 1865, 3311, 2924, 708, 3325, 792, 3100, 266, 2281, 2491, 900]
+# Modulus constant
 
 st.set_page_config(page_title="ML-KEM Architectural and Execution Analytics & Architectural Verification Framework", page_icon="🔬", layout="wide")
 
@@ -328,86 +323,33 @@ def draw_ntt_dag(
 st.sidebar.header("⚙️ Execution Framework")
 
 st.sidebar.markdown("---")
-st.sidebar.subheader("🧪 Verification Oracle")
-uploaded_file = st.sidebar.file_uploader(
-    "Upload Official ML-KEM Reference Dump (.txt, .json)",
-    type=["txt", "json"],
-    help="Upload a C-printf dump or JSON file from the official ML-KEM reference implementation."
+
+algorithm = st.sidebar.selectbox(
+    "Algorithm Selection",
+    [ALGO_STANDARD, ALGO_INCOMPLETE],
+    help=(
+        "Standard: full log2(N)-stage Cooley-Tukey NTT, resolves every "
+        "coefficient. Kyber Incomplete: stops log2(N)-1 stages early "
+        "(exactly 7 stages at N=256, matching real Kyber/ML-KEM), leaving "
+        "N/2 degree-2 blocks that get a BASE_MUL step instead."
+    ),
 )
 
-if uploaded_file is not None:
-    try:
-        file_content = uploaded_file.getvalue().decode("utf-8")
-        validator = ReferenceValidator()
-        parsed_a, parsed_b, parsed_expected = validator.parse_reference_file(file_content)
-        n = len(parsed_a)
-        algorithm = ALGO_INCOMPLETE
-        
-        # Keep base multiplication strategy selection in sidebar
-        base_mul_strategy = st.sidebar.selectbox(
-            "Base Multiplication Strategy",
-            ["Schoolbook (4 Multiplications)", "Karatsuba (3 Multiplications)"],
-            help="Karatsuba reduces coefficient-coefficient multiplications from 4 to 3.",
-            key="uploaded_base_mul"
-        )
-        base_mul_mode = "schoolbook" if "Schoolbook" in base_mul_strategy else "karatsuba"
-        
-        st.session_state.poly_a = list(parsed_a)
-        st.session_state.poly_b = list(parsed_b)
-        st.session_state.poly_n = n
-        st.session_state.parsed_expected = list(parsed_expected)
-        
-        st.sidebar.success("✅ Uploaded file parsed successfully!")
-        st.sidebar.info(f"Official ML-KEM Reference Integration Mode Active: N={n}, Incomplete NTT.")
-        load_nist_vector = False
-    except Exception as e:
-        st.sidebar.error(f"Failed to parse reference file: {e}")
-        load_nist_vector = False
-        n = 256
-        algorithm = ALGO_INCOMPLETE
-        base_mul_mode = "schoolbook"
-else:
-    load_nist_vector = st.sidebar.checkbox(
-        "Load Standard ML-KEM Test Vector",
-        value=False,
-        help="Forces N=256 and loads the hardcoded NIST reference test vector."
+base_mul_mode = "schoolbook"
+if algorithm == ALGO_INCOMPLETE:
+    base_mul_strategy = st.sidebar.selectbox(
+        "Base Multiplication Strategy",
+        ["Schoolbook (4 Multiplications)", "Karatsuba (3 Multiplications)"],
+        help="Karatsuba reduces coefficient-coefficient multiplications from 4 to 3.",
     )
+    base_mul_mode = "schoolbook" if "Schoolbook" in base_mul_strategy else "karatsuba"
 
-    if load_nist_vector:
-        n = 256
-        algorithm = ALGO_INCOMPLETE
-        base_mul_mode = "schoolbook"
-        st.session_state.poly_a = list(NIST_VECTOR_A)
-        st.session_state.poly_b = list(NIST_VECTOR_B)
-        st.session_state.poly_n = 256
-        st.sidebar.info("NIST Test Vector Mode Active: N=256, Incomplete NTT, Schoolbook Strategy.")
-    else:
-        algorithm = st.sidebar.selectbox(
-            "Algorithm Selection",
-            [ALGO_STANDARD, ALGO_INCOMPLETE],
-            help=(
-                "Standard: full log2(N)-stage Cooley-Tukey NTT, resolves every "
-                "coefficient. Kyber Incomplete: stops log2(N)-1 stages early "
-                "(exactly 7 stages at N=256, matching real Kyber/ML-KEM), leaving "
-                "N/2 degree-2 blocks that get a BASE_MUL step instead."
-            ),
-        )
-
-        base_mul_mode = "schoolbook"
-        if algorithm == ALGO_INCOMPLETE:
-            base_mul_strategy = st.sidebar.selectbox(
-                "Base Multiplication Strategy",
-                ["Schoolbook (4 Multiplications)", "Karatsuba (3 Multiplications)"],
-                help="Karatsuba reduces coefficient-coefficient multiplications from 4 to 3.",
-            )
-            base_mul_mode = "schoolbook" if "Schoolbook" in base_mul_strategy else "karatsuba"
-
-        n = st.sidebar.selectbox("Polynomial Degree (N)", DEGREE_OPTIONS, index=0)
+n = st.sidebar.selectbox("Polynomial Degree (N)", DEGREE_OPTIONS, index=0)
 
 if algorithm == ALGO_INCOMPLETE and n < 8:
     st.sidebar.warning("N must be >= 8 for a meaningful incomplete NTT (need >=2 DIF stages).")
 
-if n == 256 and not load_nist_vector and uploaded_file is None:
+if n == 256:
     st.sidebar.info(
         "N=256 is the real Kyber/ML-KEM size. Node labels are hidden above "
         f"{LABEL_NODE_THRESHOLD} nodes to keep the graph readable; color and "
@@ -415,12 +357,11 @@ if n == 256 and not load_nist_vector and uploaded_file is None:
     )
 
 # Keep polynomials A and B in session_state so they survive reruns without regenerating.
-# Reset to default polynomials whenever N changes (only when not loading custom files).
-if uploaded_file is None and not load_nist_vector:
-    if "poly_a" not in st.session_state or st.session_state.get("poly_n") != n:
-        st.session_state.poly_a = list(range(1, n + 1))  # simple deterministic default for A
-        st.session_state.poly_b = [i * 2 for i in range(1, n + 1)]  # simple deterministic default for B
-        st.session_state.poly_n = n
+# Reset to default polynomials whenever N changes.
+if "poly_a" not in st.session_state or st.session_state.get("poly_n") != n:
+    st.session_state.poly_a = list(range(1, n + 1))  # simple deterministic default for A
+    st.session_state.poly_b = [i * 2 for i in range(1, n + 1)]  # simple deterministic default for B
+    st.session_state.poly_n = n
 
     input_method = st.sidebar.radio(
         "Input Method",
@@ -528,7 +469,7 @@ st.sidebar.subheader("🛡️ Verification Settings")
 enable_fault_injection = st.sidebar.checkbox(
     "⚠️ Enable Fault Injection Mode (For Verifier Testing)",
     value=False,
-    help="Deliberately mutates the execution log right before it hits the validator to test its detection capabilities."
+    help="Deliberately mutates the execution log right before it hits the verification engine to test its detection capabilities."
 )
 
 fault_type = ""
@@ -699,10 +640,7 @@ dag_statistics = verification["dag_statistics"]
 
 st.title("ML-KEM NTT Architectural and Execution Analytics & Instance Verifier")
 st.subheader("Visualize, verify, benchmark, and diagnose cryptographic execution and architectural analytics pipelines.")
-if uploaded_file is not None:
-    st.caption("Official ML-KEM Reference Integration — step through every recorded operation.")
-else:
-    st.caption(f"{algorithm} — step through every recorded operation.")
+st.caption(f"{algorithm} — step through every recorded operation.")
 
 # --- Time-travel slider ----------------------------------------------------
 st.subheader("⏱️ Time-Travel Through Execution")
@@ -895,33 +833,16 @@ d3.metric("Total Dependency Edges", dag_statistics['total_edges'])
 # Calculate Verification Results for Dashboard Checklist
 # ---------------------------------------------------------------------------
 
-# 1. Reference Polynomial & Functional Verification
-if uploaded_file is not None:
-    expected_reference_poly = list(st.session_state.parsed_expected)
-elif load_nist_vector:
-    expected_reference_poly = list(NIST_VECTOR_EXPECTED)
+# 1. Functional Verification
+if algorithm == ALGO_STANDARD:
+    expected_reference_poly = compute_naive_reference_cached(n, MODULUS, poly_a_tuple, result.root_of_unity)
 else:
-    if algorithm == ALGO_STANDARD:
-        expected_reference_poly = compute_naive_reference_cached(n, MODULUS, poly_a_tuple, result.root_of_unity)
-    else:
-        expected_reference_poly = compute_naive_poly_mul_cached(poly_a_tuple, poly_b_tuple, MODULUS)
+    expected_reference_poly = compute_naive_poly_mul_cached(poly_a_tuple, poly_b_tuple, MODULUS)
 
-validator = ReferenceValidator()
-if uploaded_file is not None:
-    ref_report = validator.verify_reference_vector(mutated_output, expected_reference_poly, reference_type="external")
-else:
-    ref_report = validator.verify_reference_vector(mutated_output, expected_reference_poly, reference_type="internal")
-
-# Parse matches / total
-summary_line = ref_report.splitlines()[-1]
-try:
-    match_part = summary_line.split("Overall: ")[1].split(" MATCH")[0]
-    matches, total = map(int, match_part.split(" / "))
-except Exception:
-    matches, total = 0, n
-
+matches = sum(1 for a, b in zip(mutated_output, expected_reference_poly) if a == b)
+total = len(expected_reference_poly)
 functional_passed = (matches == total)
-functional_msg = f"{matches} / {total} coefficients match reference."
+functional_msg = f"{matches} / {total} coefficients match naive reference."
 
 # 2. Dependency Verification
 dep_detail = verification["dependency_check"]["detail"]
@@ -934,7 +855,7 @@ schedule_passed = dep_detail.schedule_error_message is None
 schedule_msg = dep_detail.schedule_error_message or "All dependencies executed in correct sequence order."
 
 # 4. Address Verification
-agu_report = validator.verify_address_generation(execution_log, n)
+agu_report = verifier.verify_address_generation()
 address_passed = True
 address_msg = "No duplicate, missing, or out-of-bounds address accesses."
 for stage, chk in agu_report.items():
@@ -955,9 +876,7 @@ for stage, chk in agu_report.items():
         break
 
 # 5. Twiddle Verification
-twiddle_df = validator.verify_twiddle_factors(
-    execution_log,
-    n=n,
+twiddle_df = verifier.verify_twiddle_factors(
     root=result.root_of_unity,
     modulus=result.modulus,
     algorithm_type=algorithm
@@ -1124,26 +1043,7 @@ if reports:
 else:
     st.info("No memory access reports available to generate the heatmap.")
 
-# --- 3. Reference Verification Details ---
-st.markdown("### 🥇 Functional Reference Verification Details")
-col1, col2 = st.columns([1, 2])
-with col1:
-    st.metric("Reference Verification Match", f"{matches} / {total} Match")
-with col2:
-    st.progress(matches / total)
-
-if not functional_passed:
-    st.error(f"FAIL — {total - matches} coefficient(s) disagree with the reference vector.")
-
-with st.expander("🔬 View Detailed Coefficient Verification Report", expanded=(load_nist_vector or uploaded_file is not None or not functional_passed)):
-    st.text_area(
-        "Reference Validator Output Log",
-        value=ref_report,
-        height=300,
-        disabled=True
-    )
-
-# --- 4. Twiddle Verification Details ---
+# --- 3. Twiddle Verification Details ---
 st.markdown("### 🔍 Cycle-by-Cycle Twiddle Verification Details")
 st.caption(
     "Mathematically reconstructs the expected twiddle factor for every stage "
@@ -1157,7 +1057,7 @@ if not twiddle_df.empty:
 else:
     st.info("No twiddle factor operations to verify in the current trace.")
 
-# --- 5. Address Verification Details ---
+# --- 4. Address Verification Details ---
 st.markdown("### 🛑 Address Generation Verification Details")
 st.caption(
     "Proves that the AGU (Address Generation Unit) accesses every memory address "
