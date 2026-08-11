@@ -576,7 +576,7 @@ class ScheduleVerifier:
         if not stage_entropies:
             return EntropyCheckResult(
                 passed=True,
-                checks=[("Output entropy above threshold", True)],
+                checks=[("Output entropy above threshold at all stages", True)],
                 final_entropy=1.0,
                 threshold=threshold,
                 first_anomaly_stage=None,
@@ -587,7 +587,7 @@ class ScheduleVerifier:
         final_stage = stages[-1]
         final_entropy = stage_entropies[final_stage]
 
-        passed = final_entropy >= threshold
+        passed = all(e >= threshold for e in stage_entropies.values())
 
         first_anomaly_stage = None
         for stage in stages:
@@ -595,7 +595,12 @@ class ScheduleVerifier:
                 first_anomaly_stage = stage
                 break
 
-        checks = [("Output entropy above threshold", passed)]
+        # Explicit invariant assertion: first_anomaly_stage must be None if and only if passed is True.
+        assert (first_anomaly_stage is None) == passed, (
+            f"Invariant violated: first_anomaly_stage={first_anomaly_stage} but passed={passed}"
+        )
+
+        checks = [("Output entropy above threshold at all stages", passed)]
 
         return EntropyCheckResult(
             passed=passed,
