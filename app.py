@@ -166,12 +166,11 @@ def replay_array_state(bit_reversed_input: list[int], execution_log: list[Butter
     """Reconstruct the working-memory array state step by step."""
     array = list(bit_reversed_input)
     for step in execution_log[: up_to_step + 1]:
-        addr_a, addr_b = step.outputs
-        val_a, val_b = step.value_out
-        if 0 <= addr_a < len(array):
-            array[addr_a] = val_a
-        if 0 <= addr_b < len(array):
-            array[addr_b] = val_b
+        for idx, addr in enumerate(step.outputs):
+            if idx < len(step.value_out):
+                val = step.value_out[idx]
+                if 0 <= addr < len(array):
+                    array[addr] = val
     return array
 
 def build_trace_dataframe(execution_log: list[ButterflyStep]) -> pd.DataFrame:
@@ -185,10 +184,10 @@ def build_trace_dataframe(execution_log: list[ButterflyStep]) -> pd.DataFrame:
             "Op Type": step.op_type,
             "Node ID": step.node_id,
             "Twiddle/Base Root": step.twiddle_value,
-            "Input Addr A": step.inputs[0],
-            "Input Addr B": step.inputs[1],
-            "Output Addr A": step.outputs[0],
-            "Output Addr B": step.outputs[1],
+            "Input Addr A": step.inputs[0] if len(step.inputs) > 0 else None,
+            "Input Addr B": step.inputs[1] if len(step.inputs) > 1 else None,
+            "Output Addr A": step.outputs[0] if len(step.outputs) > 0 else None,
+            "Output Addr B": step.outputs[1] if len(step.outputs) > 1 else None,
         }
         for step in execution_log
     ])
@@ -671,20 +670,26 @@ c3.metric("Zeta (ζ)" if is_base_mul else "Twiddle Factor (w)", active.twiddle_v
 c4.metric("Op Type", active.op_type)
 
 c5, c6, c7, c8 = st.columns(4)
-c5.metric("Input Addr A", active.inputs[0])
-c6.metric("Input Addr B", active.inputs[1])
-c7.metric("Output Addr A", active.outputs[0])
-c8.metric("Output Addr B", active.outputs[1])
+c5.metric("Input Addr A", active.inputs[0] if len(active.inputs) > 0 else "N/A")
+c6.metric("Input Addr B", active.inputs[1] if len(active.inputs) > 1 else "N/A")
+c7.metric("Output Addr A", active.outputs[0] if len(active.outputs) > 0 else "N/A")
+c8.metric("Output Addr B", active.outputs[1] if len(active.outputs) > 1 else "N/A")
 
 c9, c10 = st.columns(2)
 with c9:
     st.markdown("**Values IN** (before)")
-    st.code(f"a[{active.inputs[0]}] = {active.value_in[0]}\n"
-            f"a[{active.inputs[1]}] = {active.value_in[1]}")
+    in_lines = []
+    for idx, addr in enumerate(active.inputs):
+        val = active.value_in[idx] if idx < len(active.value_in) else 0
+        in_lines.append(f"a[{addr}] = {val}")
+    st.code("\n".join(in_lines) if in_lines else "N/A")
 with c10:
     st.markdown("**Values OUT** (after)")
-    st.code(f"a[{active.outputs[0]}] = {active.value_out[0]}\n"
-            f"a[{active.outputs[1]}] = {active.value_out[1]}")
+    out_lines = []
+    for idx, addr in enumerate(active.outputs):
+        val = active.value_out[idx] if idx < len(active.value_out) else 0
+        out_lines.append(f"a[{addr}] = {val}")
+    st.code("\n".join(out_lines) if out_lines else "N/A")
 
 if is_base_mul:
     st.caption(

@@ -63,6 +63,8 @@ class FaultInjector:
         attributes in-place.
         """
         memory = list(bit_reversed_input)
+        if len(memory) < 3 * n:
+            memory.extend([0] * (3 * n - len(memory)))
         topo_order = list(nx.topological_sort(graph))
 
         for node_id in topo_order:
@@ -94,19 +96,47 @@ class FaultInjector:
                 data["value_in"] = (val_a_before, val_b_before)
                 data["value_out"] = (val_a_after, val_b_after)
 
+            elif op_type == "KARATSUBA_INTERMEDIATE":
+                if len(outputs) == 1:
+                    idx_a0, idx_a1 = inputs[0], inputs[1]
+                    val_a, val_b = memory[idx_a0], memory[idx_a1]
+                    val_sum = (val_a + val_b) % modulus
+                    memory[outputs[0]] = val_sum
+                    data["value_in"] = (val_a, val_b)
+                    data["value_out"] = (val_sum, 0)
+                else:
+                    idx_a0 = inputs[0]
+                    val_sum = memory[idx_a0]
+                    data["value_in"] = (val_sum, 0)
+                    data["value_out"] = (val_sum, 0)
+
             elif op_type in ("BASE_MUL", "BASE_MUL_SCHOOLBOOK", "BASE_MUL_KARATSUBA"):
                 idx0, idx1 = outputs[0], outputs[1]
-                if len(inputs) == 4:
-                    idx_a0, idx_a1, idx_b0, idx_b1 = inputs
-                    a0, a1 = memory[idx_a0], memory[idx_a1]
+                idx_a0, idx_a1 = inputs[0], inputs[1]
+                a0, a1 = memory[idx_a0], memory[idx_a1]
+
+                is_distinct = (len(inputs) == 4 and op_type != "BASE_MUL_KARATSUBA") or (len(inputs) == 6 and op_type == "BASE_MUL_KARATSUBA")
+                if is_distinct:
+                    idx_b0, idx_b1 = inputs[2], inputs[3]
                     b0, b1 = memory[idx_b0], memory[idx_b1]
                 else:
-                    idx_a0, idx_a1 = inputs
-                    a0, a1 = memory[idx_a0], memory[idx_a1]
                     b0, b1 = a0, a1
 
-                r0 = (a0 * b0 + twiddle * (a1 * b1)) % modulus
-                r1 = (a0 * b1 + a1 * b0) % modulus
+                if op_type == "BASE_MUL_KARATSUBA":
+                    scratch_addr_1 = inputs[4] if is_distinct else inputs[2]
+                    scratch_addr_2 = inputs[5] if is_distinct else inputs[3]
+                    sum_a = memory[scratch_addr_1]
+                    sum_b = memory[scratch_addr_2]
+                    
+                    m0 = (a0 * b0) % modulus
+                    m1 = (a1 * b1) % modulus
+                    m2 = (sum_a * sum_b) % modulus
+                    
+                    r0 = (m0 + twiddle * m1) % modulus
+                    r1 = (m2 - m0 - m1) % modulus
+                else:
+                    r0 = (a0 * b0 + twiddle * (a1 * b1)) % modulus
+                    r1 = (a0 * b1 + a1 * b0) % modulus
 
                 memory[idx0] = r0
                 memory[idx1] = r1
