@@ -579,10 +579,14 @@ class NTTEngine:
         if b is None:
             b = a
 
-        # Track up to 2*n addresses if two distinct polynomials are used, otherwise self.n
-        max_addr = 2 * self.n if b is not a else self.n
+        # Track memory writer up to 3*n addresses to cover the scratch region allocated for Karatsuba base-mul
+        max_addr = 3 * self.n
         if not self._last_writer:
             self._last_writer = {addr: None for addr in range(max_addr)}
+        else:
+            for addr in range(max_addr):
+                if addr not in self._last_writer:
+                    self._last_writer[addr] = None
 
         num_bits = self.log_n - 1
         op_type = "BASE_MUL_SCHOOLBOOK" if mode == "schoolbook" else "BASE_MUL_KARATSUBA"
@@ -611,23 +615,149 @@ class NTTEngine:
 
             c[idx0], c[idx1] = r0, r1
 
-            # Create node in graph
-            node_id = f"S{stage}_M{i}"
-            
-            # If b is a, inputs are idx0, idx1. If b is distinct, inputs are idx0, idx1 and offset idx0+n, idx1+n
-            if b is not a:
-                inputs_tuple = (idx0, idx1, idx0 + self.n, idx1 + self.n)
-                value_in_tuple = (a0, a1) # Display values of Polynomial A in active step
-            else:
-                inputs_tuple = (idx0, idx1)
-                value_in_tuple = (a0, a1)
-
             twiddle_index = 2 * br_i + 1
             address_params = {
                 "i": i,
                 "is_distinct": b is not a,
                 "n": self.n
             }
+
+            if mode == "karatsuba":
+                scratch_addr_1 = 2 * self.n + 2 * i
+                scratch_addr_2 = 2 * self.n + 2 * i + 1
+
+                # 1. WRITE node for storing (a0 + a1)
+                node_id_wa = f"S{stage}_M{i}_WA"
+                val_sum_a = (a0 + a1) % self.q
+                inputs_wa = (idx0, idx1)
+                self.graph.add_node(
+                    node_id_wa,
+                    stage_number=stage,
+                    butterfly_index=i,
+                    twiddle_value=zeta,
+                    twiddle_index=twiddle_index,
+                    address_params=address_params,
+                    inputs=inputs_wa,
+                    outputs=(scratch_addr_1,),
+                    value_in=(a0, a1),
+                    value_out=(val_sum_a, 0),
+                    op_type="KARATSUBA_INTERMEDIATE",
+                )
+                for addr in inputs_wa:
+                    producer = self._last_writer.get(addr)
+                    if producer is not None:
+                        self.graph.add_edge(producer, node_id_wa, memory_address=addr)
+                self._last_writer[scratch_addr_1] = node_id_wa
+                self._record_step(
+                    node_id_wa, stage, i, zeta, inputs_wa, (scratch_addr_1,),
+                    a0, a1, val_sum_a, 0,
+                    twiddle_index=twiddle_index,
+                    address_params=address_params,
+                    op_type="KARATSUBA_INTERMEDIATE",
+                )
+
+                # 2. WRITE node for storing (b0 + b1)
+                node_id_wb = f"S{stage}_M{i}_WB"
+                val_sum_b = (b0 + b1) % self.q
+                addr_b0 = idx0 + self.n if b is not a else idx0
+                addr_b1 = idx1 + self.n if b is not a else idx1
+                inputs_wb = (addr_b0, addr_b1)
+                self.graph.add_node(
+                    node_id_wb,
+                    stage_number=stage,
+                    butterfly_index=i,
+                    twiddle_value=zeta,
+                    twiddle_index=twiddle_index,
+                    address_params=address_params,
+                    inputs=inputs_wb,
+                    outputs=(scratch_addr_2,),
+                    value_in=(b0, b1),
+                    value_out=(val_sum_b, 0),
+                    op_type="KARATSUBA_INTERMEDIATE",
+                )
+                for addr in inputs_wb:
+                    producer = self._last_writer.get(addr)
+                    if producer is not None:
+                        self.graph.add_edge(producer, node_id_wb, memory_address=addr)
+                self._last_writer[scratch_addr_2] = node_id_wb
+                self._record_step(
+                    node_id_wb, stage, i, zeta, inputs_wb, (scratch_addr_2,),
+                    b0, b1, val_sum_b, 0,
+                    twiddle_index=twiddle_index,
+                    address_params=address_params,
+                    op_type="KARATSUBA_INTERMEDIATE",
+                )
+
+                # 3. READ node for retrieving (a0 + a1)
+                node_id_ra = f"S{stage}_M{i}_RA"
+                self.graph.add_node(
+                    node_id_ra,
+                    stage_number=stage,
+                    butterfly_index=i,
+                    twiddle_value=zeta,
+                    twiddle_index=twiddle_index,
+                    address_params=address_params,
+                    inputs=(scratch_addr_1,),
+                    outputs=(),
+                    value_in=(val_sum_a, 0),
+                    value_out=(val_sum_a, 0),
+                    op_type="KARATSUBA_INTERMEDIATE",
+                )
+                producer = self._last_writer.get(scratch_addr_1)
+                if producer is not None:
+                    self.graph.add_edge(producer, node_id_ra, memory_address=scratch_addr_1)
+                self._record_step(
+                    node_id_ra, stage, i, zeta, (scratch_addr_1,), (),
+                    val_sum_a, 0, val_sum_a, 0,
+                    twiddle_index=twiddle_index,
+                    address_params=address_params,
+                    op_type="KARATSUBA_INTERMEDIATE",
+                )
+
+                # 4. READ node for retrieving (b0 + b1)
+                node_id_rb = f"S{stage}_M{i}_RB"
+                self.graph.add_node(
+                    node_id_rb,
+                    stage_number=stage,
+                    butterfly_index=i,
+                    twiddle_value=zeta,
+                    twiddle_index=twiddle_index,
+                    address_params=address_params,
+                    inputs=(scratch_addr_2,),
+                    outputs=(),
+                    value_in=(val_sum_b, 0),
+                    value_out=(val_sum_b, 0),
+                    op_type="KARATSUBA_INTERMEDIATE",
+                )
+                producer = self._last_writer.get(scratch_addr_2)
+                if producer is not None:
+                    self.graph.add_edge(producer, node_id_rb, memory_address=scratch_addr_2)
+                self._record_step(
+                    node_id_rb, stage, i, zeta, (scratch_addr_2,), (),
+                    val_sum_b, 0, val_sum_b, 0,
+                    twiddle_index=twiddle_index,
+                    address_params=address_params,
+                    op_type="KARATSUBA_INTERMEDIATE",
+                )
+
+            # Create final base-mul node in graph
+            node_id = f"S{stage}_M{i}"
+            
+            # If b is a, inputs are idx0, idx1. If b is distinct, inputs are idx0, idx1 and offset idx0+n, idx1+n
+            if mode == "schoolbook":
+                if b is not a:
+                    inputs_tuple = (idx0, idx1, idx0 + self.n, idx1 + self.n)
+                else:
+                    inputs_tuple = (idx0, idx1)
+            else:
+                scratch_addr_1 = 2 * self.n + 2 * i
+                scratch_addr_2 = 2 * self.n + 2 * i + 1
+                if b is not a:
+                    inputs_tuple = (idx0, idx1, idx0 + self.n, idx1 + self.n, scratch_addr_1, scratch_addr_2)
+                else:
+                    inputs_tuple = (idx0, idx1, scratch_addr_1, scratch_addr_2)
+
+            value_in_tuple = (a0, a1) # Display values of Polynomial A in active step
 
             self.graph.add_node(
                 node_id,
